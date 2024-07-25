@@ -1,8 +1,11 @@
 from flask import Blueprint, render_template, redirect, url_for, flash, request
 from . import socketio, db
-from .models import User
+from .models import User, Message
 from flask_login import login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
 
 main = Blueprint('main', __name__)
 
@@ -36,7 +39,7 @@ def login():
             flash('Invalid username or password')
             return redirect(url_for('main.login'))
         login_user(user)
-        return redirect(url_for('main.index'))
+        return redirect(url_for('main.chat'))
     return render_template('login.html')
 
 @main.route('/logout')
@@ -45,12 +48,26 @@ def logout():
     logout_user()
     return redirect(url_for('main.index'))
 
-@main.route('/protected')
+@main.route('/chat')
 @login_required
-def protected():
-    return f"Hello, {current_user.username}! You are logged in."
+def chat():
+    return render_template('chat.html')
+
+@main.route('/send_message', methods=['POST'])
+@login_required
+def send_message():
+    message = request.form['message']
+    username = current_user.username
+    new_message = Message(content=message, user=current_user)
+    db.session.add(new_message)
+    db.session.commit()
+    message_data = {'username': username, 'message': message}
+    logging.debug(f"Message stored: {message_data}")
+    socketio.emit('message', message_data, broadcast=True)
+    logging.debug(f"Message emitted to clients: {message_data}")
+    return redirect(url_for('main.chat'))
 
 @socketio.on('message')
 def handle_message(data):
-    print('received message: ' + data)
-    socketio.send('Reply: ' + data)
+    logging.debug(f"Received message from client: {data}")
+    socketio.send(data)
