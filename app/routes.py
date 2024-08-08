@@ -1,7 +1,10 @@
-from flask import Blueprint, render_template, redirect, url_for, flash, request
+from flask import Blueprint, jsonify, request, redirect, url_for
+from sqlalchemy.exc import IntegrityError
 from . import socketio, db
-from .models import User, Message
+from .models.user import User
+from .models.message import Message
 from flask_login import login_user, logout_user, login_required, current_user
+from flask_cors import cross_origin
 import logging
 
 logging.basicConfig(level=logging.DEBUG)
@@ -10,36 +13,60 @@ main = Blueprint('main', __name__)
 
 @main.route('/')
 def index():
-    return render_template('index.html')
+    return redirect(url_for('main.chat'))
 
-@main.route('/signup', methods=['GET', 'POST'])
+@main.route('/signup', methods=['POST'])
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
 def signup():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        if User.query.filter_by(username=username).first():
-            flash('Username already exists')
-            return redirect(url_for('main.signup'))
-        new_user = User(username=username)
+    data = request.get_json()
+    logging.debug(f"Received signup data: {data}")
+    if not data:
+        return jsonify({"error": "Invalid data"}), 400
+
+    username = data.get('username')
+    email = data.get('email')  # Remove this if email is not needed
+    password = data.get('password')
+
+    if not username or not password:
+        return jsonify({"error": "Missing required fields"}), 400
+
+    if User.query.filter_by(username=username).first():
+        return jsonify({"error": "Username already exists"}), 400
+
+    # Email check if email is part of the user model
+    if email and User.query.filter_by(email=email).first():
+        return jsonify({"error": "Email already exists"}), 400
+
+    try:
+        new_user = User(username=username, email=email)
         new_user.set_password(password)
         db.session.add(new_user)
         db.session.commit()
-        flash('User created successfully')
-        return redirect(url_for('main.login'))
-    return render_template('signup.html')
 
-@main.route('/login', methods=['GET', 'POST'])
+        logging.debug("User created successfully")
+        return jsonify({"message": "User created successfully"}), 201
+    except IntegrityError as e:
+        db.session.rollback()
+        logging.error(f"IntegrityError: {str(e)}")
+        return jsonify({"error": "Database error occurred"}), 500
+
+@main.route('/login', methods=['POST'])
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
 def login():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        user = User.query.filter_by(username=username).first()
-        if user is None or not user.check_password(password):
-            flash('Invalid username or password')
-            return redirect(url_for('main.login'))
-        login_user(user)
-        return redirect(url_for('main.chat'))
-    return render_template('login.html')
+    data = request.get_json()
+    logging.debug(f"Received login data: {data}")
+    username = data.get('username')
+    password = data.get('password')
+    user = User.query.filter_by(username=username).first()
+    if user is None:
+        logging.error('User not found')
+        return jsonify({"error": "Invalid username or password"}), 401
+    if not user.check_password(password):
+        logging.error('Incorrect password')
+        return jsonify({"error": "Invalid username or password"}), 401
+    login_user(user)
+    logging.info('Login successful')
+    return jsonify({"message": "Login successful"}), 200
 
 @main.route('/logout')
 @login_required
@@ -47,86 +74,65 @@ def logout():
     logout_user()
     return redirect(url_for('main.index'))
 
-@main.route('/chat')
+@main.route('/api/contacts', methods=['GET'])
 @login_required
-def chat():
-    users = User.query.all()
-    return render_template('chat.html', users=users)
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
+def get_contacts():
+    users = User.query.filter(User.id != current_user.id).all()
+    contacts = [{'id': user.id, 'name': user.username, 'status': 'online'} for user in users]
+    return jsonify({'contacts': contacts})
 
-@main.route('/send_message', methods=['POST'])
+@main.route('/api/messages/<int:contact_id>', methods=['GET'])
 @login_required
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
+def get_messages(contact_id):
+    messages = Message.query.filter(
+        ((Message.sender_id == current_user.id) & (Message.recipient_id == contact_id)) |
+        ((Message.sender_id == contact_id) & (Message.recipient_id == current_user.id))
+    ).order_by(Message.timestamp.asc()).all()
+    return jsonify({'messages': [{'id': msg.id, 'content': msg.content, 'sender_id': msg.sender_id, 'timestamp': msg.timestamp} for msg in messages]})
+
+@main.route('/api/messages', methods=['POST'])
+@login_required
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
 def send_message():
-    recipient_username = request.form['recipient']
-    message_content = request.form['message']
-    recipient = User.query.filter_by(username=recipient_username).first()
-    
-    if recipient:
-        new_message = Message(content=message_content, sender=current_user, recipient=recipient)
-        db.session.add(new_message)
+    data = request.get_json()
+    recipient_id = data.get('recipient_id')
+    if recipient_id is None:
+        return jsonify({'error': 'Recipient ID is required'}), 400
+    message = Message(content=data['content'], sender_id=current_user.id, recipient_id=recipient_id)
+    db.session.add(message)
+    db.session.commit()
+    socketio.emit('message', {'id': message.id, 'content': message.content, 'sender_id': message.sender_id, 'recipient_id': recipient_id, 'timestamp': message.timestamp}, broadcast=True)
+    return jsonify({'id': message.id, 'content': message.content, 'sender_id': message.sender_id, 'recipient_id': recipient_id, 'timestamp': message.timestamp})
+
+@main.route('/api/messages/<int:message_id>/like', methods=['POST'])
+@login_required
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
+def like_message(message_id):
+    message = Message.query.get(message_id)
+    if message:
+        message.likes = message.likes + 1 if hasattr(message, 'likes') else 1
         db.session.commit()
-        message_data = {
-            'sender': current_user.username,
-            'recipient': recipient.username,
-            'message': message_content
-        }
-        logging.debug(f"Message stored: {message_data}")
-        socketio.emit('message', message_data, broadcast=True)
-        logging.debug(f"Message emitted to clients: {message_data}")
-        return redirect(url_for('main.chat'))
-    else:
-        flash('Recipient not found')
-        return redirect(url_for('main.chat'))
+        return jsonify({'id': message.id, 'content': message.content, 'sender_id': message.sender_id, 'likes': message.likes})
+    return jsonify({'error': 'Message not found'}), 404
+
+@main.route('/api/profile', methods=['GET', 'PUT'])
+@login_required
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
+def profile():
+    if request.method == 'GET':
+        user = User.query.get(current_user.id)
+        return jsonify({'profile': {'username': user.username, 'email': user.email}})
+    if request.method == 'PUT':
+        data = request.get_json()
+        user = User.query.get(current_user.id)
+        user.username = data['username']
+        user.email = data['email']
+        db.session.commit()
+        return jsonify({'success': True})
 
 @socketio.on('message')
 def handle_message(data):
     logging.debug(f"Received message from client: {data}")
     socketio.send(data)
-
-@main.route('/profile/<username>')
-@login_required
-def profile(username):
-    user = User.query.filter_by(username=username).first_or_404()
-    return render_template('profile.html', user=user)
-
-@main.route('/edit_profile', methods=['GET', 'POST'])
-@login_required
-def edit_profile():
-    if request.method == 'POST':
-        current_user.username = request.form['username']
-        db.session.commit()
-        flash('Profile updated successfully')
-        return redirect(url_for('main.profile', username=current_user.username))
-    return render_template('edit_profile.html')
-
-@main.route('/reset_password', methods=['GET', 'POST'])
-def reset_password():
-    if request.method == 'POST':
-        username = request.form['username']
-        user = User.query.filter_by(username=username).first()
-        if user:
-            # Implement the actual password reset logic here (e.g., sending a reset email)
-            flash('Password reset link sent to your email')
-            return redirect(url_for('main.login'))
-        else:
-            flash('Username not found')
-            return redirect(url_for('main.reset_password'))
-    return render_template('reset_password.html')
-
-@main.route('/message_history/<recipient_username>')
-@login_required
-def message_history(recipient_username):
-    recipient = User.query.filter_by(username=recipient_username).first_or_404()
-    messages = Message.query.filter(
-        (Message.sender_id == current_user.id) & (Message.recipient_id == recipient.id) |
-        (Message.sender_id == recipient.id) & (Message.recipient_id == current_user.id)
-    ).order_by(Message.timestamp.asc()).all()
-    return render_template('message_history.html', messages=messages, recipient=recipient)
-
-@main.route('/search_users', methods=['GET', 'POST'])
-@login_required
-def search_users():
-    if request.method == 'POST':
-        search_term = request.form['search_term']
-        users = User.query.filter(User.username.contains(search_term)).all()
-        return render_template('search_results.html', users=users, search_term=search_term)
-    return render_template('search_users.html')

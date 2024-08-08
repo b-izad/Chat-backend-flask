@@ -3,5 +3,7 @@ Flask-SocketIO
 Flask-SQLAlchemy
 Flask-Migrate
 Flask-Login
+flask-cors
 psycopg2-binary
 Werkzeug
+
