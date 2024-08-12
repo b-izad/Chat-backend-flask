@@ -1,15 +1,16 @@
-# app/routes/main_routes.py
-
-from flask import Blueprint, render_template, redirect, url_for, flash, request
+from flask import Blueprint, jsonify, request, render_template, redirect, url_for, flash
 from flask_login import login_user, logout_user, login_required, current_user
-from app import socketio, db  # Import extensions directly from app
+from app import db, socketio
 from app.models.user_model import User
 from app.models.message_model import Message
+from app.models.contact_model import Contact
 import logging
 
 logging.basicConfig(level=logging.DEBUG)
 
 main = Blueprint('main', __name__)
+
+
 
 @main.route('/')
 def index():
@@ -19,75 +20,108 @@ def index():
 def signup():
     if request.method == 'POST':
         username = request.form['username']
+        email = request.form['email']  
         password = request.form['password']
+
+      
         if User.query.filter_by(username=username).first():
             flash('Username already exists')
             return redirect(url_for('main.signup'))
-        new_user = User(username=username)
+        
+        if User.query.filter_by(email=email).first():
+            flash('Email already exists')
+            return redirect(url_for('main.signup'))
+
+   
+        new_user = User(username=username, email=email)
         new_user.set_password(password)
         db.session.add(new_user)
         db.session.commit()
         flash('User created successfully')
         return redirect(url_for('main.login'))
+
     return render_template('signup.html')
+
 
 @main.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
+        data = request.json
+        username = data.get('username')
+        password = data.get('password')
+        
         user = User.query.filter_by(username=username).first()
         if user is None or not user.check_password(password):
-            flash('Invalid username or password')
-            return redirect(url_for('main.login'))
+            return jsonify(message='Invalid username or password'), 401
+
         login_user(user)
-        return redirect(url_for('main.chat'))
+        return jsonify(message='Login successful')
     return render_template('login.html')
 
-@main.route('/logout')
+@main.route('/logout', methods=['POST'])
 @login_required
 def logout():
     logout_user()
-    return redirect(url_for('main.index'))
+    return jsonify(message='Logout successful')
 
-@main.route('/chat')
+
+
+
+@main.route('/api/contacts', methods=['GET'])
 @login_required
-def chat():
-    users = User.query.all()
-    return render_template('chat.html', users=users)
+def get_contacts():
+    contacts = Contact.query.filter_by(user_id=current_user.id).all()
+    contacts_list = [{"id": contact.contact_id, "username": contact.contact.username, "email": contact.contact.email} for contact in contacts]
+    return jsonify(contacts=contacts_list)
 
-@main.route('/send_message', methods=['POST'])
+@main.route('/api/contacts/add', methods=['POST'])
+@login_required
+def add_contact():
+    data = request.json
+    contact_id = data.get('contactId')
+
+    if not contact_id:
+        return jsonify(success=False, error='Contact ID is required'), 400
+
+    if Contact.query.filter_by(user_id=current_user.id, contact_id=contact_id).first():
+        return jsonify(success=False, error='Contact already exists'), 409
+
+    new_contact = Contact(user_id=current_user.id, contact_id=contact_id)
+    db.session.add(new_contact)
+    db.session.commit()
+
+    return jsonify(success=True, contact={"id": new_contact.contact_id, "username": new_contact.contact.username, "email": new_contact.contact.email})
+
+@main.route('/api/messages/<int:contact_id>', methods=['GET'])
+@login_required
+def get_messages(contact_id):
+    messages = Message.query.filter(
+        ((Message.sender_id == current_user.id) & (Message.recipient_id == contact_id)) |
+        ((Message.sender_id == contact_id) & (Message.recipient_id == current_user.id))
+    ).order_by(Message.timestamp.asc()).all()
+    messages_list = [{"id": msg.id, "content": msg.content, "sender_id": msg.sender_id, "recipient_id": msg.recipient_id, "timestamp": msg.timestamp} for msg in messages]
+    return jsonify(messages=messages_list)
+
+@main.route('/api/messages', methods=['POST'])
 @login_required
 def send_message():
-    recipient_username = request.form['recipient']
-    message_content = request.form['message']
-    recipient = User.query.filter_by(username=recipient_username).first()
-    
-    if recipient:
-        new_message = Message(content=message_content, sender=current_user, recipient=recipient)
-        db.session.add(new_message)
-        db.session.commit()
-        message_data = {
-            'sender': current_user.username,
-            'recipient': recipient.username,
-            'message': message_content
-        }
-        logging.debug(f"Message stored: {message_data}")
-        socketio.emit('message', message_data, broadcast=True)
-        logging.debug(f"Message emitted to clients: {message_data}")
-        return redirect(url_for('main.chat'))
-    else:
-        flash('Recipient not found')
-        return redirect(url_for('main.chat'))
+    data = request.json
+    recipient_id = data.get('recipient_id')
+    content = data.get('content')
 
-@socketio.on('message')
-def handle_message(data):
-    logging.debug(f"Received message from client: {data}")
-    socketio.send(data)
+    if not recipient_id or not content:
+        return jsonify(success=False, error='Recipient and content are required'), 400
+
+    new_message = Message(content=content, sender_id=current_user.id, recipient_id=recipient_id)
+    db.session.add(new_message)
+    db.session.commit()
+
+    return jsonify(success=True, message={"id": new_message.id, "content": new_message.content, "sender_id": new_message.sender_id, "recipient_id": new_message.recipient_id, "timestamp": new_message.timestamp})
+
 
 @main.route('/profile/<username>')
 @login_required
-def profile(username):
+def user_profile(username):
     user = User.query.filter_by(username=username).first_or_404()
     return render_template('profile.html', user=user)
 
@@ -107,7 +141,6 @@ def reset_password():
         username = request.form['username']
         user = User.query.filter_by(username=username).first()
         if user:
-            # Implement the actual password reset logic here (e.g., sending a reset email)
             flash('Password reset link sent to your email')
             return redirect(url_for('main.login'))
         else:
