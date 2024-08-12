@@ -1,8 +1,10 @@
+# app/routes/main_routes.py
+
 from flask import Blueprint, render_template, redirect, url_for, flash, request
-from . import socketio, db
-from .models import User, Message
 from flask_login import login_user, logout_user, login_required, current_user
-from werkzeug.security import generate_password_hash, check_password_hash
+from app import socketio, db  # Import extensions directly from app
+from app.models.user_model import User
+from app.models.message_model import Message
 import logging
 
 logging.basicConfig(level=logging.DEBUG)
@@ -122,6 +124,7 @@ def message_history(recipient_username):
         (Message.sender_id == recipient.id) & (Message.recipient_id == current_user.id)
     ).order_by(Message.timestamp.asc()).all()
     return render_template('message_history.html', messages=messages, recipient=recipient)
+
 @main.route('/search_users', methods=['GET', 'POST'])
 @login_required
 def search_users():
