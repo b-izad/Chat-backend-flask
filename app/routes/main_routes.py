@@ -4,13 +4,12 @@ from app import db, socketio
 from app.models.user_model import User
 from app.models.message_model import Message
 from app.models.contact_model import Contact
+from flask_socketio import emit, join_room, leave_room
 import logging
 
 logging.basicConfig(level=logging.DEBUG)
 
 main = Blueprint('main', __name__)
-
-
 
 @main.route('/')
 def index():
@@ -23,7 +22,6 @@ def signup():
         email = request.form['email']  
         password = request.form['password']
 
-      
         if User.query.filter_by(username=username).first():
             flash('Username already exists')
             return redirect(url_for('main.signup'))
@@ -32,7 +30,6 @@ def signup():
             flash('Email already exists')
             return redirect(url_for('main.signup'))
 
-   
         new_user = User(username=username, email=email)
         new_user.set_password(password)
         db.session.add(new_user)
@@ -41,7 +38,6 @@ def signup():
         return redirect(url_for('main.login'))
 
     return render_template('signup.html')
-
 
 @main.route('/login', methods=['GET', 'POST'])
 def login():
@@ -63,9 +59,6 @@ def login():
 def logout():
     logout_user()
     return jsonify(message='Logout successful')
-
-
-
 
 @main.route('/api/contacts', methods=['GET'])
 @login_required
@@ -102,22 +95,56 @@ def get_messages(contact_id):
     messages_list = [{"id": msg.id, "content": msg.content, "sender_id": msg.sender_id, "recipient_id": msg.recipient_id, "timestamp": msg.timestamp} for msg in messages]
     return jsonify(messages=messages_list)
 
-@main.route('/api/messages', methods=['POST'])
+# Updated send_message route using Socket.IO
+@socketio.on('send_message')
 @login_required
-def send_message():
-    data = request.json
+def handle_send_message(data):
     recipient_id = data.get('recipient_id')
     content = data.get('content')
 
     if not recipient_id or not content:
-        return jsonify(success=False, error='Recipient and content are required'), 400
+        emit('error', {'success': False, 'error': 'Recipient and content are required'})
+        return
 
     new_message = Message(content=content, sender_id=current_user.id, recipient_id=recipient_id)
     db.session.add(new_message)
     db.session.commit()
 
-    return jsonify(success=True, message={"id": new_message.id, "content": new_message.content, "sender_id": new_message.sender_id, "recipient_id": new_message.recipient_id, "timestamp": new_message.timestamp})
+    # Emit the message to the recipient's room
+    recipient_room = f'user_{recipient_id}'
+    emit('receive_message', {
+        'id': new_message.id,
+        'content': new_message.content,
+        'sender_id': current_user.id,
+        'recipient_id': recipient_id,
+        'timestamp': new_message.timestamp.isoformat()
+    }, room=recipient_room)
 
+    # Emit the message to the sender's room as well
+    sender_room = f'user_{current_user.id}'
+    emit('receive_message', {
+        'id': new_message.id,
+        'content': new_message.content,
+        'sender_id': current_user.id,
+        'recipient_id': recipient_id,
+        'timestamp': new_message.timestamp.isoformat()
+    }, room=sender_room)
+
+@socketio.on('join')
+@login_required
+def on_join(data):
+    username = current_user.username
+    room = f'user_{username}'
+    join_room(room)
+    emit('status', {'msg': f'{username} has entered the chat'}, room=room)
+
+@socketio.on('leave')
+@login_required
+def on_leave(data):
+    username = current_user.username
+    room = f'user_{username}'
+    leave_room(room)
+    emit('status', {'msg': f'{username} has left the chat'}, room=room)
 
 @main.route('/profile/<username>')
 @login_required
@@ -166,3 +193,4 @@ def search_users():
         users = User.query.filter(User.username.contains(search_term)).all()
         return render_template('search_results.html', users=users, search_term=search_term)
     return render_template('search_users.html')
+
